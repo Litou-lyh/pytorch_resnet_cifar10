@@ -1,7 +1,10 @@
 import argparse
 import os
+from scheduler import MultiStageScheduler
 import shutil
 import time
+from typing_extensions import get_args
+import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
@@ -21,7 +24,7 @@ model_names = sorted(name for name in resnet.__dict__
 print(model_names)
 
 parser = argparse.ArgumentParser(description='Propert ResNets for CIFAR10 in pytorch')
-parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet32',
+parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet56',
                     choices=model_names,
                     help='model architecture: ' + ' | '.join(model_names) +
                     ' (default: resnet32)')
@@ -33,11 +36,11 @@ parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('-b', '--batch-size', default=128, type=int,
                     metavar='N', help='mini-batch size (default: 128)')
-parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
+parser.add_argument('--lr', '--base_lr', default=0.1, type=float,
                     metavar='LR', help='initial learning rate')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
-parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float,
+parser.add_argument('--weight-decay', '--wd', default=5e-4, type=float,
                     metavar='W', help='weight decay (default: 1e-4)')
 parser.add_argument('--print-freq', '-p', default=50, type=int,
                     metavar='N', help='print frequency (default: 50)')
@@ -55,20 +58,37 @@ parser.add_argument('--save-dir', dest='save_dir',
 parser.add_argument('--save-every', dest='save_every',
                     help='Saves checkpoints at every specified number of epochs',
                     type=int, default=10)
+parser.add_argument('--gpu', '--device', dest='gpu',
+                     help='gpu_id',
+                     type=str, default='cuda:0')
+parser.add_argument('--policy','--p', nargs='*', dest='policy', help=
+                    'lr scheduler', type=str, default=['step'])
+parser.add_argument('--milestones', nargs='*', help=
+                    'milestones', type=int, default=None) 
+parser.add_argument('--max_lr', default=3.0, type=float,
+                    help='max learning rate')        
+parser.add_argument('--exp', dest='exp',type=str, help='experiments: super / lr_range', default='super')
+parser.add_argument('--seed', dest='seed',type=int,default=None)
+parser.add_argument('--max_iters', dest='max_iters',type=int,default=float('inf'))
 best_prec1 = 0
-
+iters = 0
 
 def main():
-    global args, best_prec1
+    global args, best_prec1,iters
     args = parser.parse_args()
-
+    print('policy:',args.policy)
+    if args.seed:
+        torch.backends.cudnn.deterministic = True
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed(args.seed)
+#        np.random.seed(args.seed)
 
     # Check the save_dir exists or not
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir)
 
-    model = torch.nn.DataParallel(resnet.__dict__[args.arch]())
-    model.cuda()
+    model = torch.nn.DataParallel(resnet.__dict__[args.arch](),device_ids=[args.gpu])
+    model.cuda(args.gpu)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -77,6 +97,7 @@ def main():
             checkpoint = torch.load(args.resume)
             args.start_epoch = checkpoint['epoch']
             best_prec1 = checkpoint['best_prec1']
+
             model.load_state_dict(checkpoint['state_dict'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.evaluate, checkpoint['epoch']))
@@ -107,7 +128,7 @@ def main():
         num_workers=args.workers, pin_memory=True)
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
     if args.half:
         model.half()
@@ -115,35 +136,76 @@ def main():
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
-                                weight_decay=args.weight_decay)
+                                weight_decay=args.weight_decay,nesterov=False)
 
-    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                        milestones=[100, 150], last_epoch=args.start_epoch - 1)
+    max_iter = args.max_iters#10000
+    scheduler = None
+    second_scheduler = None
+    switch_iter = float('inf')
 
-    if args.arch in ['resnet1202', 'resnet110']:
+    # if args.p1 == 'cyclic':
+    #     max_iter = 80000
+    # if args.p2: 
+    #     max_iter = 15000
+    #     switch_iter = 10000
+
+    # sche_list = [scheduler, second_scheduler]    
+    # policy_list = [args.p1, args.p2]
+    # for idx, p in enumerate(policy_list):
+    #     if p == 'cyclic':
+    #         sche_list[idx] = torch.optim.lr_scheduler.CyclicLR(optimizer, 0.1, 0.3, step_size_up=2000, step_size_down=None,
+    #                     mode='triangular', gamma=1.0, scale_fn=None, scale_mode='cycle', cycle_momentum=True,
+    #                     base_momentum=0.8, max_momentum=0.9, last_epoch=-1)
+
+    #     elif p == 'rop':
+    #         sche_list[idx] = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=10, threshold=0.0001,
+    #                                             threshold_mode='rel', cooldown=0, min_lr=0, eps=1e-08, verbose=False)
+    #     elif p == 'step': # small problem, default p2 != step
+    #         sche_list[idx] = torch.optim.lr_scheduler.MultiStepLR(optimizer,
+    #                             milestones=[100,150], last_epoch=args.start_epoch - 1)
+    #     else:
+    #         sche_list[idx] = None
+
+    scheduler = MultiStageScheduler(optimizer, args)
+ 
+  #  if args.arch in ['resnet1202', 'resnet110']:
         # for resnet1202 original paper uses lr=0.01 for first 400 minibatches for warm-up
         # then switch back. In this setup it will correspond for first epoch.
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = args.lr*0.1
+ #       for param_group in optimizer.param_groups:
+#            param_group['lr'] = args.lr*0.1
 
 
+    # current_sche = sche_list[0]
     if args.evaluate:
         validate(val_loader, model, criterion)
         return
-
     for epoch in range(args.start_epoch, args.epochs):
-
+        if iters >= max_iter:
+            break
+        # if iters == switch_iter:
+        #     current_sche = sche_list[1]
+        print(f"lr: {optimizer.state_dict()['param_groups'][0]['lr']}")
         # train for one epoch
-        print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
-        train(train_loader, model, criterion, optimizer, epoch)
-        lr_scheduler.step()
-
+        if scheduler and type(scheduler.current_scheduler) == torch.optim.lr_scheduler.CyclicLR:
+            train(train_loader, model, criterion, optimizer, epoch, scheduler=scheduler)
+        else:
+            train(train_loader, model, criterion, optimizer, epoch, scheduler=None)
         # evaluate on validation set
-        prec1 = validate(val_loader, model, criterion)
-
+        prec1 = 0
+        if args.exp == 'super' or epoch == 99:    # only for lr range test
+            prec1 = validate(val_loader, model, criterion)
+        else:
+            next
         # remember best prec@1 and save checkpoint
         is_best = prec1 > best_prec1
         best_prec1 = max(prec1, best_prec1)
+
+        '''Change LR policy here'''        
+        if scheduler:
+            if type(scheduler.current_scheduler) == torch.optim.lr_scheduler.ReduceLROnPlateau:
+                scheduler.step(prec1)
+            elif type(scheduler.current_scheduler) == torch.optim.lr_scheduler.MultiStepLR or type(scheduler.current_scheduler) == torch.optim.lr_scheduler.CosineAnnealingWarmRestarts or type(scheduler.current_scheduler) == torch.optim.lr_scheduler.CosineAnnealingLR:
+                scheduler.step()
 
         if epoch > 0 and epoch % args.save_every == 0:
             save_checkpoint({
@@ -156,9 +218,12 @@ def main():
             'state_dict': model.state_dict(),
             'best_prec1': best_prec1,
         }, is_best, filename=os.path.join(args.save_dir, 'model.th'))
+        
+        #print(f"lr: {optimizer.state_dict()['param_groups'][0]['lr']}")
 
 
-def train(train_loader, model, criterion, optimizer, epoch):
+def train(train_loader, model, criterion, optimizer, epoch, scheduler=None, switch_iter=float('inf')):
+    global iters
     """
         Run one train epoch
     """
@@ -176,8 +241,8 @@ def train(train_loader, model, criterion, optimizer, epoch):
         # measure data loading time
         data_time.update(time.time() - end)
 
-        target = target.cuda()
-        input_var = input.cuda()
+        target = target.cuda(args.gpu)
+        input_var = input.cuda(args.gpu)
         target_var = target
         if args.half:
             input_var = input_var.half()
@@ -190,6 +255,11 @@ def train(train_loader, model, criterion, optimizer, epoch):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+        # for CLR policy
+        if scheduler:
+            scheduler.step()
+        iters += 1
 
         output = output.float()
         loss = loss.float()
@@ -213,6 +283,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
 
 def validate(val_loader, model, criterion):
+    global acc_list
     """
     Run evaluation
     """
@@ -226,9 +297,9 @@ def validate(val_loader, model, criterion):
     end = time.time()
     with torch.no_grad():
         for i, (input, target) in enumerate(val_loader):
-            target = target.cuda()
-            input_var = input.cuda()
-            target_var = target.cuda()
+            target = target.cuda(args.gpu)
+            input_var = input.cuda(args.gpu)
+            target_var = target.cuda(args.gpu)
 
             if args.half:
                 input_var = input_var.half()
@@ -242,6 +313,7 @@ def validate(val_loader, model, criterion):
 
             # measure accuracy and record loss
             prec1 = accuracy(output.data, target)[0]
+#            acc_list.append(prec1.item())
             losses.update(loss.item(), input.size(0))
             top1.update(prec1.item(), input.size(0))
 
@@ -259,7 +331,7 @@ def validate(val_loader, model, criterion):
 
     print(' * Prec@1 {top1.avg:.3f}'
           .format(top1=top1))
-
+    acc_list.append(top1.avg)
     return top1.avg
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
@@ -303,4 +375,21 @@ def accuracy(output, target, topk=(1,)):
 
 
 if __name__ == '__main__':
+    print(str(None))
+    acc_list = []
     main()
+    plt.plot([i for i in range(len(acc_list))], acc_list, '.-')
+    plt.xlabel('epoch')
+    plt.ylabel('test acc')
+    plt.show()
+
+    with open('test_acc_plot.txt','a') as f:
+        f.write(f'policy: {args.policy}, lr: {args.lr}, bs: {args.batch_size}, e: {args.epochs}, seed: {args.seed} ')
+        f.write('[')
+        for j in range(len(acc_list)):
+            f.write(str(acc_list[j]) + ', ')
+        f.write(']\n')   
+# plt.plot([i for i in range(len(acc_list))], acc_list, '.-')
+  #  plt.xlabel('epoch')
+ #   plt.ylabel('test acc')
+#    plt.show()
